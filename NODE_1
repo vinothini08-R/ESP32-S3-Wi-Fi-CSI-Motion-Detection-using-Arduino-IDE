@@ -1,0 +1,254 @@
+/*
+  DIY Cardputer - HUB NODE (Fixed Version with Graph)
+  Upload this to your HUB board (Board 1) ONLY.
+  Sensor nodes (Board 2, 3) do NOT need any changes.
+
+  FIXES APPLIED:
+  1. Baseline freeze during motion (was drifting toward
+     the "moved" value even while motion was ongoing,
+     causing spikes to decay too fast)
+  2. Removed duplicate updateHistory() call from
+     handleRoot() - was double-smoothing the signal,
+     making real spikes look weaker than they are
+  3. Auto-calibrated threshold at startup instead of a
+     fixed 3.0, based on your actual room's idle noise
+*/
+
+#include <WiFi.h>
+#include "esp_wifi.h"
+#include <esp_now.h>
+#include <WebServer.h>
+
+#define NODE_ID 1
+
+const char* WIFI_SSID     = "ULTRA_800_2844";
+const char* WIFI_PASSWORD = "1234567890";
+
+WebServer server(80);
+
+typedef struct {
+  int nodeId;
+  float motionLevel;
+  bool motionDetected; // received but not used for the final decision anymore
+} MotionPacket;
+
+// Raw levels per zone (zone 1 = this board itself)
+float zoneLevel[4] = {0, 0, 0, 0};
+unsigned long zoneLastSeen[4] = {0, 0, 0, 0};
+
+// ---- Threshold (now auto-calibrated at startup, not fixed) ----
+float MOTION_THRESHOLD = 3.0; // default fallback, overwritten in setup()
+
+// ---- Smoothing (reduces jagged spikes, makes wave flow smoothly) ----
+float smoothedOverall = 0;
+const float SMOOTHING_FACTOR = 0.25; // lower = smoother/slower, higher = more responsive
+
+// ---- History buffer for the graph (combined/overall level) ----
+#define HISTORY_LEN 80
+float history[HISTORY_LEN];
+int historyIndex = 0;
+
+float baselineAvg = 0;
+bool baselineSet = false;
+
+// Push current overall level into history buffer (called from loop, not from web request)
+void updateHistory() {
+  unsigned long now = millis();
+  float overall = 0;
+  for (int i = 1; i <= 3; i++) {
+    if (now - zoneLastSeen[i] <= 3000) {
+      if (zoneLevel[i] > overall) overall = zoneLevel[i];
+    }
+  }
+  // Exponential smoothing - removes jagged single-sample spikes,
+  // while still rising/falling clearly for real motion
+  smoothedOverall = smoothedOverall * 0.75 + overall * 0.25;
+
+  history[historyIndex] = smoothedOverall;
+  historyIndex = (historyIndex + 1) % HISTORY_LEN;
+}
+
+void csi_callback(void *ctx, wifi_csi_info_t *info) {
+  if (!info || !info->buf) return;
+  int8_t *csi_data = info->buf;
+  int len = info->len;
+
+  long sum = 0;
+  for (int i = 0; i < len; i++) sum += abs(csi_data[i]);
+  float avg = (float)sum / len;
+
+  if (!baselineSet) {
+    baselineAvg = avg;
+    baselineSet = true;
+    return;
+  }
+
+  float diff = abs(avg - baselineAvg);
+  zoneLevel[1] = diff;
+  zoneLastSeen[1] = millis();
+
+  // FIX 1: only drift the baseline toward the new value when we're
+  // NOT in the middle of motion. Otherwise sustained motion gets
+  // slowly "absorbed" into the baseline and the graph flattens out.
+  if (diff < MOTION_THRESHOLD) {
+    baselineAvg = baselineAvg * 0.98 + avg * 0.02;
+  }
+}
+
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  MotionPacket packet;
+  memcpy(&packet, data, sizeof(packet));
+  if (packet.nodeId >= 1 && packet.nodeId <= 3) {
+    zoneLevel[packet.nodeId] = packet.motionLevel;
+    zoneLastSeen[packet.nodeId] = millis();
+  }
+}
+
+// Build a smooth curve SVG path from the history buffer using quadratic bezier segments
+String buildGraphSVG() {
+  int w = 560, h = 200;
+  float maxVal = 12.0; // graph vertical scale (adjust if levels usually go higher)
+
+  String svg = "<svg width='" + String(w) + "' height='" + String(h) +
+               "' style='background:#1b1b1b;border-radius:10px;'>";
+
+  // threshold line (dashed) at the calibrated threshold value
+  int thresholdY = h - (int)((MOTION_THRESHOLD / maxVal) * h);
+  svg += "<line x1='0' y1='" + String(thresholdY) + "' x2='" + String(w) +
+         "' y2='" + String(thresholdY) +
+         "' stroke='#e67e22' stroke-width='2' stroke-dasharray='6,6' />";
+
+  // the wave itself - smooth curve using quadratic bezier midpoints
+  // (this avoids sharp jagged corners between points)
+  int xs[HISTORY_LEN], ys[HISTORY_LEN];
+  for (int i = 0; i < HISTORY_LEN; i++) {
+    int idx = (historyIndex + i) % HISTORY_LEN; // oldest to newest
+    float val = history[idx];
+    if (val > maxVal) val = maxVal;
+    xs[i] = (i * w) / (HISTORY_LEN - 1);
+    ys[i] = h - (int)((val / maxVal) * h);
+  }
+
+  svg += "<path fill='none' stroke='#2ecc71' stroke-width='3' stroke-linecap='round' d='";
+  svg += "M " + String(xs[0]) + "," + String(ys[0]) + " ";
+  for (int i = 0; i < HISTORY_LEN - 1; i++) {
+    int mx = (xs[i] + xs[i + 1]) / 2;
+    int my = (ys[i] + ys[i + 1]) / 2;
+    svg += "Q " + String(xs[i]) + "," + String(ys[i]) + " " + String(mx) + "," + String(my) + " ";
+  }
+  svg += "' />";
+
+  svg += "</svg>";
+  return svg;
+}
+
+void handleRoot() {
+  // FIX 2: updateHistory() removed from here - it was being called
+  // both here (on every page load, refresh=1s) AND in loop() every
+  // 300ms, which double-applied the exponential smoothing and made
+  // real spikes look much weaker than the raw signal actually is.
+  // loop() alone keeps the history buffer updated at a steady rate.
+
+  float overall = history[(historyIndex + HISTORY_LEN - 1) % HISTORY_LEN];
+  bool motion = overall > MOTION_THRESHOLD;
+
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta http-equiv='refresh' content='1'>";
+  html += "<title>Motion Detector</title>";
+  html += "<style>";
+  html += "body{font-family:Arial;background:#111;color:#eee;text-align:center;padding-top:40px;}";
+  html += "h1{color:#0f0;margin-bottom:5px;}";
+  html += ".status{font-size:26px;font-weight:bold;margin:15px 0;padding:15px;border-radius:12px;display:inline-block;width:300px;}";
+  html += ".motion{background:#c0392b;color:white;}";
+  html += ".stable{background:#2c3e50;color:#bbb;}";
+  html += ".label{font-size:14px;color:#888;margin-top:10px;}";
+  html += "</style></head><body>";
+  html += "<h1>Room Motion Monitor</h1>";
+  html += "<div class='status ";
+  html += (motion ? "motion" : "stable");
+  html += "'>" + String(motion ? "MOTION DETECTED" : "STABLE") + "</div><br>";
+  html += buildGraphSVG();
+  html += "<div class='label'>Threshold = " + String(MOTION_THRESHOLD, 1) +
+          " (orange dashed line) &nbsp;|&nbsp; Current level = " + String(overall, 1) + "</div>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  for (int i = 0; i < HISTORY_LEN; i++) history[i] = 0;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 30) {
+    delay(500);
+    retries++;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi FAILED - check credentials.");
+    while (1) delay(1000);
+  }
+
+  Serial.print("Open in browser: http://");
+  Serial.println(WiFi.localIP());
+
+  esp_now_init();
+  esp_now_register_recv_cb(onDataRecv);
+
+  wifi_csi_config_t csi_config = {
+    .lltf_en = true,
+    .htltf_en = true,
+    .stbc_htltf2_en = true,
+    .ltf_merge_en = true,
+    .channel_filter_en = true,
+    .manu_scale = false,
+    .shift = 0,
+  };
+  esp_wifi_set_csi_config(&csi_config);
+  esp_wifi_set_csi_rx_cb(&csi_callback, NULL);
+  esp_wifi_set_csi(true);
+
+  server.on("/", handleRoot);
+  server.begin();
+
+  delay(3000); // initial pause, stay still (lets CSI baseline settle first)
+  Serial.println("Calibrating threshold - stay still for 3 seconds...");
+
+  // FIX 3: measure actual idle noise in THIS room instead of
+  // assuming 3.0 works everywhere. Stay still during this window.
+  float calibSum = 0;
+  int calibCount = 30;
+  for (int i = 0; i < calibCount; i++) {
+    updateHistory();
+    float v = history[(historyIndex + HISTORY_LEN - 1) % HISTORY_LEN];
+    calibSum += v;
+    delay(100);
+  }
+  float idleAvg = calibSum / calibCount;
+  MOTION_THRESHOLD = idleAvg + 1.5; // margin above idle noise, tune this if needed
+
+  Serial.print("Idle average: ");
+  Serial.println(idleAvg);
+  Serial.print("Calibrated threshold set to: ");
+  Serial.println(MOTION_THRESHOLD);
+
+  Serial.println("Ready.");
+}
+
+unsigned long lastHistoryUpdate = 0;
+
+void loop() {
+  server.handleClient();
+
+  // keep history updating even between page loads, every 300ms
+  if (millis() - lastHistoryUpdate > 300) {
+    lastHistoryUpdate = millis();
+    updateHistory();
+  }
+}
